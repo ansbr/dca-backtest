@@ -1,0 +1,272 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © rouxam
+
+//@version=4
+// Author: rouxam
+strategy("Backtesting 3commas DCA Bot v2", overlay=true, pyramiding=99, process_orders_on_close=true, commission_type=strategy.commission.percent, commission_value=0.1, initial_capital=1094.56)
+
+// Important Note : Initial Capital above is written to match the default value based on bot parameters.
+//                  It is expected the user will update the initial_capital via the GUI Parameters > Properties tab
+//                  A warning will displayed in case initial capital and max amount for bot usage do not match.
+
+// ----------------------------------
+// Strategy Inputs
+// ----------------------------------
+take_profit             = input(3.0, type=input.float,  title="Take Profit (%)", minval=0.0, step=0.1)/100
+take_profit_type        = input(defval="% from total volume", title="Take Profit Type", options=["% from total volume", "% from base order"])
+ttp                     = input(0.5, type=input.float,  title="Trailing Take Profit (%) [0 = Disabled]", minval=0.0, step=0.1)/100
+stop_loss               = input(0.0, type=input.float,  title="Stop Loss (%) [0 = Disabled]", minval=0.0, step=0.1)/100
+base_order              = input(100.0, type=input.float,title="Base Order") 
+safe_order              = input(140.0, type=input.float,title="Safety Order") 
+max_safe_order          = input(4,                      title="Max Safety Trades Count", minval=0, maxval=99, step=1) 
+price_deviation         = input(2.0, type=input.float,  title="Price deviation to open safety order (%)", minval=0.0, step=0.1)/100
+safe_order_volume_scale = input(1.4, type=input.float,  title="Safety Order Volume Scale", step=0.1) 
+safe_order_step_scale   = input(1.5, type=input.float,  title="Safety Order Step Scale", step=0.1) 
+dsc                     = input(defval="RSI-7",         title="Deal Start Condition", options=["Start ASAP", "RSI-7"])
+dsc_rsi_threshold       = input(defval=30,              title=" [For Deal Start Condition = RSI-7] RSI Threshold", minval=1, maxval=99)
+bot_direction           = input(defval="Long",          title="Bot Direction", options=["Long", "Short"])
+start_time              = input(defval=timestamp("May 01 2021"),   title="Start Time",     type=input.time)
+end_time                = input(defval=timestamp("Dec 31 2021"),   title="End Time",       type=input.time)
+
+
+// ----------------------------------
+// Declarations
+// ----------------------------------
+var bo_level = 0.0
+var last_so_level = 0.0
+var so_level = 0.0
+var ttp_active = false
+var ttp_extremum = 0.0
+var ttp_level = 0.0
+var stop_level = 0.0
+var take_profit_level = 0.0
+var deal_start_condition = false
+var deal_counter = 0
+var stop_loss_counter = 0
+var stop_loss_on_bar = false
+var latest_price = close
+
+
+// CONSTANTS
+var float init_price = na
+var IS_LONG = bot_direction == "Long"
+
+
+// ----------------------------------
+// Utilities functions
+// ----------------------------------
+pretty_date(t) => tostring(dayofmonth(t)) + "/" + tostring(month(t)) + "/" + tostring(year(t))
+
+within_window() => time >= start_time and time <= end_time
+
+safety_order_deviation(index) => price_deviation * pow(safe_order_step_scale,  index - 1)
+
+safety_order_price(index, last_safety_order_price) => 
+    if IS_LONG
+        last_safety_order_price * (1 - safety_order_deviation(index))
+    else
+        last_safety_order_price * (1 + safety_order_deviation(index))
+
+safety_order_qty(index) => safe_order * pow(safe_order_volume_scale, index - 1)
+
+max_amount_for_bot_usage() =>
+    var total_qty = base_order
+    var last_order_qty = safe_order
+    total_qty := base_order
+    last_order_qty := safe_order
+    if max_safe_order > 0
+        for index = 1 to max_safe_order
+            total_qty := total_qty + safety_order_qty(index)
+    total_qty // returned value
+
+max_deviation() =>
+    var total_deviation = 0.0
+    total_deviation := 0.0
+    for index = 1 to max_safe_order
+        total_deviation := total_deviation + safety_order_deviation(index)
+
+currency_format() =>
+    if syminfo.currency == "USDT" or syminfo.currency == "USD" or syminfo.currency == "TUSD" or syminfo.currency == "BUSD"
+        "#.##"
+    else if syminfo.currency == "BTC"
+        "#.########"
+    else
+        // TODO (rouxam) list more options
+        "#.####"
+
+bot_setup_string() =>
+    var ret = ""
+    ret := "Deal Start Condition: " + dsc + "\n"
+    if ttp > 0.0
+        ret := ret + "TTP: " + tostring(take_profit, "#.##%") + "(" + tostring(ttp, "#.##%") + "), "
+    else
+        ret := ret + "TP: " + tostring(take_profit, "#.##%") + ", "
+    ret := ret + "BO: " + tostring(base_order, currency_format()) + " " + syminfo.currency + ", "
+    ret := ret + "SO: " + tostring(safe_order, currency_format()) + " " + syminfo.currency + ", "
+    ret := ret + "OS: " + tostring(safe_order_volume_scale) + ", "
+    ret := ret + "SS: " + tostring(safe_order_step_scale) + ", "
+    ret := ret + "SOS: " + tostring(price_deviation, "#.##%")
+    if stop_loss > 0.0
+        ret := ret + ", " + "SL: " + tostring(stop_loss, "#.##%")
+    ret := ret + "\n"
+
+var max_amount = max_amount_for_bot_usage()
+var max_dev = max_deviation()
+rsi7 = rsi(close, 7)
+rsi_signal = IS_LONG ? rsi7 < dsc_rsi_threshold : rsi7 > dsc_rsi_threshold // Regular strat would be crossover but not for 3C DCA Bot
+init_price := na(init_price) and within_window() ? open : init_price
+latest_price := within_window() ? close : latest_price
+
+// ----------------------------------
+// (Re-)Initialize
+// ----------------------------------
+if strategy.position_size == 0.0
+    ttp_extremum := 0.0
+    ttp_active := false
+    deal_start_condition := false
+
+// ----------------------------------
+// Open deal with Base Order on Deal Start Condition
+// ----------------------------------
+if(strategy.opentrades == 0 and within_window() and close > 0 and strategy.equity > 0.0)
+    // Compute deal start condition
+    if dsc == "Start ASAP"
+        deal_start_condition := true
+        bo_level := close
+    if dsc == "RSI-7"
+        deal_start_condition := rsi_signal
+        bo_level := close
+
+    // Place Buy Order
+    if deal_start_condition
+        deal_counter := deal_counter + 1
+        if IS_LONG
+            strategy.entry("BO", limit=bo_level, long=strategy.long, qty=base_order/bo_level)
+        else
+            strategy.entry("BO", limit=bo_level, long=strategy.short, qty=base_order/bo_level)
+
+        last_so_level := bo_level
+
+        // Place Safety Orders
+        if max_safe_order > 0
+            for index = 1 to max_safe_order
+                so_level := safety_order_price(index, last_so_level)
+                so_name = "SO" + tostring(index) 
+                if IS_LONG
+                    strategy.entry(so_name, long=strategy.long, limit=so_level, qty=safety_order_qty(index)/so_level)
+                else
+                    strategy.entry(so_name, long=strategy.short, limit=so_level, qty=safety_order_qty(index)/so_level)
+                last_so_level := so_level
+
+// ----------------------------------
+// Close Deal on SL, TP or TTP
+// ----------------------------------
+if abs(strategy.position_size) > 0
+    take_profit_factor = IS_LONG ? (1 + take_profit) : (1 - take_profit)
+    stop_loss_factor = IS_LONG ? (1 - stop_loss) : (1 + stop_loss)
+    ttp_factor = IS_LONG ? (1 - ttp) : (1 + ttp)
+    stop_level := bo_level * stop_loss_factor
+    if take_profit_type == "% from total volume"
+        take_profit_level := strategy.position_avg_price * take_profit_factor
+    else
+        take_profit_level := bo_level * take_profit_factor
+
+    // Stop Loss
+    stop_loss_on_bar := false
+    if stop_loss > max_dev and not ttp_active
+        if IS_LONG and low < stop_level
+            stop_loss_counter := stop_loss_counter + 1
+            strategy.exit(id="x", stop=stop_level, comment="SL")
+            stop_loss_on_bar := true
+        else if not IS_LONG and high > stop_level
+            stop_loss_counter := stop_loss_counter + 1
+            strategy.exit(id="x", stop=stop_level, comment="SL")
+            stop_loss_on_bar := true
+    if not stop_loss_on_bar
+        if ttp == 0.0
+            // Simple take profit
+            strategy.exit(id="x", limit=take_profit_level, comment="TP")
+        else
+            // Trailing take profit
+            if IS_LONG and high >= take_profit_level 
+                ttp_extremum := max(high, ttp_extremum)
+                ttp_active := true
+            if not IS_LONG and low <= take_profit_level
+                ttp_extremum := max(low, ttp_extremum)
+                ttp_active := true
+            if ttp_active 
+                ttp_level := ttp_extremum * ttp_factor
+                strategy.exit(id="x", stop=ttp_level, comment="TTP")
+
+// ----------------------------------
+// Results
+// ----------------------------------
+profit = max(strategy.equity, 0.0) - strategy.initial_capital
+profit_pct = profit / strategy.initial_capital
+
+// Prepare Results
+var label results_label = na
+var string results_text = na
+var results = array.new_string(0, "")
+if (not na(results_label))
+    // Constant Refresh
+    label.delete(results_label)
+
+array.push(results, bot_setup_string())
+array.push(results, "Max Amount For Bot Usage: " + tostring(max_amount, currency_format()) + " " + syminfo.currency)
+array.push(results, "Initial Capital: " + tostring(strategy.initial_capital, currency_format()) + " " + syminfo.currency)
+array.push(results, "Final Capital: " + tostring(max(strategy.equity, 0.0), currency_format()) + " " + syminfo.currency)
+array.push(results, "Net Result: " + tostring(profit, currency_format()) + " " + syminfo.currency + " (" +  tostring(profit_pct, "#.##%") + ")")
+array.push(results, "Total Deals: " + tostring(deal_counter))
+if stop_loss > 0.0
+    array.push(results, "Deals Closed on Stop Loss: " + tostring(stop_loss_counter))
+if IS_LONG
+    buy_hold_profit = (latest_price - init_price) / init_price * strategy.initial_capital
+    buy_hold_profit_pct = buy_hold_profit / strategy.initial_capital
+    ratio = profit_pct / buy_hold_profit_pct
+    array.push(results, "")
+    array.push(results, "Net Result for Buy-and-hold: " + tostring(buy_hold_profit, currency_format()) + " " + syminfo.currency + " (" +  tostring(buy_hold_profit_pct, "#.##%") + ")")
+    array.push(results, "(Bot Performance) / (Buy-and-hold Performance) = " + tostring(ratio, "#.###"))
+array.reverse(results)
+
+results_text := "BACKTESTING FROM " + pretty_date(start_time) + " TO " + pretty_date(end_time) + "\n********************************************************\n"
+for index = 1 to array.size(results)
+    results_text := results_text + array.pop(results) + "\n"
+results_label := label.new(time, close, text=results_text, xloc=xloc.bar_time, color=color.teal, style=label.style_label_left, textcolor=color.white, textalign=text.align_left)
+label.set_xy(results_label, time + 10 * (time - time[1]), open)
+
+
+// Prepare Warnings
+
+var string warnings_text = na
+var warnings = array.new_string(0, "")
+var label warnings_label = na
+var color warnings_col = color.red
+
+if (not na(warnings_label))
+    // Constant Refresh
+    label.delete(warnings_label)
+
+if (max_amount / strategy.initial_capital > 1.005 or max_amount / strategy.initial_capital < 0.995)
+    array.push(warnings, "Strategy Initial Capital (currently " + tostring(strategy.initial_capital, currency_format()) + " " + syminfo.currency
+                       + ") must match Max Amount For Bot Usage (" + tostring(max_amount, currency_format()) + " " + syminfo.currency + ")")
+if (max_dev >= 1.0)
+    array.push(warnings, "Max Price Deviation (" + tostring(max_dev, "#.##%") + ") cannot be >= 100.0%")
+if (stop_loss > 0.0 and stop_loss <= max_dev)
+    array.push(warnings, "Stop Loss (" + tostring(stop_loss, "#.##%") + ") should be greater than Max Price Deviation (" + tostring(max_dev, "#.##%") + ")")
+if ((timeframe.isminutes and not (tonumber(timeframe.period) < 30)) or timeframe.isdwm)
+    array.push(warnings, "Backtesting may be inaccurate. Recommended to use timeframe of 15m or less")
+if (ttp >= take_profit)
+    array.push(warnings, "Trailing Take Profit (" + tostring(ttp, "#.##%") + ") cannot be greater than Take Profit (" + tostring(take_profit, "#.##%") + ")")
+
+if (array.size(warnings) > 0)
+    warnings_text := "Please review your strategy settings: \n****************\n"
+    warnings_col := color.red
+    for index = 1 to array.size(warnings)
+        warnings_text := warnings_text + array.pop(warnings) + "\n"
+else
+    warnings_col := color.green
+    warnings_text := "Sanity checks OK"
+
+warnings_label := label.new(time, close, text=warnings_text, xloc=xloc.bar_time, color=warnings_col, style=label.style_label_right, textcolor=color.white, textalign=text.align_left)
+label.set_xy(warnings_label, time + 10 * (time - time[1]), open)
